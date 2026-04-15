@@ -1,0 +1,41 @@
+# Build artifacts
+target/
+*.rs.bk
+
+# IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Git
+.git/
+.gitignore
+.gitattributes
+
+# Documentation (not needed in image)
+*.md
+docs/
+
+# Test fixtures (not needed in production image)
+tests/fixtures/
+
+# CI/CD
+.github/
+.gitlab-ci.yml
+
+# Docker files themselves
+Dockerfile*
+.dockerignore
+
+# Temporary files
+*.tmp
+*.log
+.DS_Store
+
+# Examples (not needed in production)
+examples/
+
+# Cache directories
+.cache/

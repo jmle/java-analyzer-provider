@@ -1,0 +1,7 @@
+- message: 'Simple test rule'
+  ruleID: simple-test-001
+  effort: 1
+  when:
+    java.referenced:
+      pattern: "java.util.List"
+      location: IMPORT

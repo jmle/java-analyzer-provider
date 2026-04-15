@@ -1,0 +1,33 @@
+[
+    {
+        "name": "java",
+        "address": "localhost:9000",
+        "initConfig": [
+            {
+                "location": "/home/jmle/Dev/redhat/java-analyzer-provider/e2e-tests/examples/java/example",
+                "analysisMode": "source-only"
+            },
+            {
+                "location": "/home/jmle/Dev/redhat/java-analyzer-provider/e2e-tests/examples/inclusion-tests",
+                "providerSpecificConfig": {
+                    "includedPaths": [
+                        "src/main/java/io/konveyor/util/FileReader.java"
+                    ]
+                },
+                "analysisMode": "source-only"
+            },
+            {
+                "location": "/home/jmle/Dev/redhat/java-analyzer-provider/e2e-tests/examples/customers-tomcat-legacy",
+                "analysisMode": "source-only"
+            },
+            {
+                "location": "/home/jmle/Dev/redhat/java-analyzer-provider/e2e-tests/examples/gradle-multi-project-example",
+                "analysisMode": "source-only"
+            },
+            {
+                "location": "/home/jmle/Dev/redhat/java-analyzer-provider/e2e-tests/examples/sample-tiles-app",
+                "analysisMode": "source-only"
+            }
+        ]
+    }
+]

@@ -1,0 +1,73 @@
+[package]
+name = "java-analyzer-provider"
+version = "0.1.0"
+edition = "2021"
+authors = ["Konveyor Team"]
+description = "Self-contained Rust-based Java analyzer provider for Konveyor"
+license = "Apache-2.0"
+
+[dependencies]
+# Core async runtime and gRPC
+tokio = { version = "1.45", features = ["full"] }
+tokio-stream = "0.1"
+tonic = "0.13"
+tonic-reflection = "0.13"
+
+# Java parsing and semantic analysis
+tree-sitter = "0.24"
+tree-sitter-java = "0.23"
+stack-graphs = "0.14"
+tree-sitter-stack-graphs = "0.10"
+
+# Pattern matching
+regex = "1.11"
+wildmatch = "2.1"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+prost = "0.13"
+prost-types = "0.13"
+
+# XML parsing (for Maven pom.xml)
+quick-xml = "0.36"
+
+# Archive handling (JAR/WAR/EAR)
+zip = "2"
+
+# Hashing (for dependency cache)
+sha2 = "0.10"
+
+# HTTP client (for Maven Central API)
+reqwest = { version = "0.12", features = ["json"] }
+
+# Utilities
+anyhow = "1"
+thiserror = "1"
+tempfile = "3"
+which = "6"
+dirs = "5"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[build-dependencies]
+tonic-build = "0.13"
+dlprotoc = "0.1"
+
+[dev-dependencies]
+tokio-test = "0.4"
+
+[features]
+default = []
+generate-proto = []
+
+[lib]
+name = "java_analyzer_provider"
+path = "src/lib.rs"
+
+[[bin]]
+name = "java-analyzer-provider"
+path = "src/main.rs"

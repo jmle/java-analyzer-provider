@@ -1,0 +1,35 @@
+FROM fullstorydev/grpcurl:latest as grpcurl
+
+FROM registry.access.redhat.com/ubi9/ubi
+
+# Install Rust toolset, Java, Maven, Gradle, and utilities
+RUN dnf install -y rust-toolset unzip java-17-openjdk-devel maven nmap-ncat less git && \
+    dnf clean all
+
+# Install Gradle
+RUN curl -L https://services.gradle.org/distributions/gradle-8.5-bin.zip -o /tmp/gradle.zip && \
+    unzip /tmp/gradle.zip -d /opt && \
+    ln -s /opt/gradle-8.5/bin/gradle /usr/local/bin/gradle && \
+    rm /tmp/gradle.zip
+
+# Install protoc for gRPC development
+RUN curl -LO https://github.com/protocolbuffers/protobuf/releases/download/v30.2/protoc-30.2-linux-x86_64.zip && \
+    unzip protoc-30.2-linux-x86_64.zip -d $HOME/protoc && \
+    ln -s $HOME/protoc/bin/protoc /usr/local/bin/ && \
+    rm protoc-30.2-linux-x86_64.zip
+
+# Copy grpcurl for testing gRPC endpoints
+COPY --from=grpcurl /bin/grpcurl /usr/local/bin/grpcurl
+
+# Set Java environment
+ENV JAVA_HOME=/usr/lib/jvm/java-17-openjdk
+ENV PATH="${JAVA_HOME}/bin:${PATH}"
+
+WORKDIR /java-provider
+COPY . /java-provider/
+
+# Build the project
+RUN PROTOC=$HOME/protoc/bin/protoc cargo build
+
+# Default command for testing
+ENTRYPOINT ["cargo", "test"]

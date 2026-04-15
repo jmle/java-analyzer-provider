@@ -1,0 +1,26 @@
+com.example:sample-tiles-app:war:1.0.0-SNAPSHOT
++- org.springframework:spring-webmvc:jar:5.3.30:compile
+|  +- org.springframework:spring-aop:jar:5.3.30:compile
+|  +- org.springframework:spring-beans:jar:5.3.30:compile
+|  +- org.springframework:spring-context:jar:5.3.30:compile
+|  +- org.springframework:spring-core:jar:5.3.30:compile
+|  |  \- org.springframework:spring-jcl:jar:5.3.30:compile
+|  +- org.springframework:spring-expression:jar:5.3.30:compile
+|  \- org.springframework:spring-web:jar:5.3.30:compile
++- org.apache.tiles:tiles-jsp:jar:3.0.8:compile
+|  +- org.slf4j:slf4j-api:jar:1.7.6:compile
+|  \- org.apache.tiles:tiles-request-jsp:jar:1.0.7:compile
+|     \- org.apache.tiles:tiles-request-api:jar:1.0.7:compile
++- org.apache.tiles:tiles-servlet:jar:3.0.8:compile
+|  +- org.apache.tiles:tiles-core:jar:3.0.8:compile
+|  |  +- commons-digester:commons-digester:jar:2.0:compile
+|  |  |  \- commons-beanutils:commons-beanutils:jar:1.8.0:compile
+|  |  \- org.slf4j:jcl-over-slf4j:jar:1.7.6:compile
+|  \- org.apache.tiles:tiles-request-servlet:jar:1.0.7:compile
++- org.apache.tiles:tiles-template:jar:3.0.8:compile
+|  +- org.apache.tiles:tiles-api:jar:3.0.8:compile
+|  \- org.apache.tiles:tiles-autotag-core-runtime:jar:1.2:compile
++- org.apache.tiles:tiles-el:jar:3.0.8:compile
++- javax.servlet:javax.servlet-api:jar:4.0.1:provided
++- javax.servlet.jsp:javax.servlet.jsp-api:jar:2.3.3:provided
+\- javax.servlet:jstl:jar:1.2:compile

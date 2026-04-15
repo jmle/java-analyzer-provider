@@ -1,0 +1,154 @@
+# Location Types Test Rules
+# One rule per location type to verify all 15 location types work
+
+# 1. TYPE
+- ruleID: location-type-TYPE
+  message: "TYPE location test: {{name}} found at {{file}}:{{lineNumber}}"
+  when:
+    java.referenced:
+      pattern: "*CustomResourceDefinition*"
+      location: TYPE
+  category: mandatory
+  effort: 1
+
+# 2. IMPORT
+- ruleID: location-type-IMPORT
+  message: "IMPORT location test: {{name}}"
+  when:
+    java.referenced:
+      pattern: org.springframework.web.servlet.ViewResolver
+      location: IMPORT
+  category: mandatory
+  effort: 1
+
+# 3. PACKAGE
+- ruleID: location-type-PACKAGE
+  message: "PACKAGE location test: {{name}}"
+  when:
+    java.referenced:
+      pattern: org.springframework.web.servlet
+      location: PACKAGE
+  category: mandatory
+  effort: 1
+
+# 4. VARIABLE_DECLARATION
+- ruleID: location-type-VARIABLE_DECLARATION
+  message: "VARIABLE_DECLARATION location test: {{name}}"
+  when:
+    java.referenced:
+      pattern: "*"
+      location: VARIABLE_DECLARATION
+  category: mandatory
+  effort: 1
+
+# 5. FIELD
+- ruleID: location-type-FIELD
+  message: "FIELD location test: {{name}}"
+  when:
+    java.referenced:
+      pattern: io.konveyor.demo.ordermanagement.repository.CustomerRepository
+      location: FIELD
+  category: mandatory
+  effort: 1
+
+# 6. FIELD_DECLARATION
+- ruleID: location-type-FIELD_DECLARATION
+  message: "FIELD_DECLARATION location test: {{name}}"
+  when:
+    java.referenced:
+      pattern: io.konveyor.demo.ordermanagement.repository.CustomerRepository
+      location: FIELD_DECLARATION
+  category: mandatory
+  effort: 1
+
+# 7. METHOD
+- ruleID: location-type-METHOD
+  message: "METHOD location test: {{name}}"
+  when:
+    java.referenced:
+      pattern: entityManagerFactory
+      location: METHOD
+  category: mandatory
+  effort: 1
+
+# 8. METHOD_CALL
+- ruleID: location-type-METHOD_CALL
+  message: "METHOD_CALL location test: {{name}}"
+  when:
+    java.referenced:
+      pattern: com.example.service.HomeService.doThings
+      location: METHOD_CALL
+  category: mandatory
+  effort: 1
+
+# 9. CONSTRUCTOR_CALL
+- ruleID: location-type-CONSTRUCTOR_CALL
+  message: "CONSTRUCTOR_CALL location test: {{name}}"
+  when:
+    java.referenced:
+      pattern: "*"
+      location: CONSTRUCTOR_CALL
+  category: mandatory
+  effort: 1
+
+# 10. ANNOTATION
+- ruleID: location-type-ANNOTATION
+  message: "ANNOTATION location test: {{name}}"
+  when:
+    java.referenced:
+      pattern: org.springframework.stereotype.Controller
+      location: ANNOTATION
+  category: mandatory
+  effort: 1
+
+# 11. IMPLEMENTS_TYPE
+- ruleID: location-type-IMPLEMENTS_TYPE
+  message: "IMPLEMENTS_TYPE location test: {{name}}"
+  when:
+    java.referenced:
+      pattern: org.springframework.web.WebApplicationInitializer
+      location: IMPLEMENTS_TYPE
+  category: mandatory
+  effort: 1
+
+# 12. INHERITANCE (extends)
+- ruleID: location-type-INHERITANCE
+  message: "INHERITANCE location test: {{name}}"
+  when:
+    java.referenced:
+      pattern: "*"
+      location: INHERITANCE
+  category: mandatory
+  effort: 1
+
+# 13. RETURN_TYPE
+- ruleID: location-type-RETURN_TYPE
+  message: "RETURN_TYPE location test: {{name}}"
+  when:
+    java.referenced:
+      pattern: "*"
+      location: RETURN_TYPE
+  category: mandatory
+  effort: 1
+
+# 14. CLASS
+- ruleID: location-type-CLASS
+  message: "CLASS location test: {{name}}"
+  when:
+    java.referenced:
+      pattern: '*'
+      location: CLASS
+      annotated:
+        pattern: org.springframework.stereotype.Controller
+  category: mandatory
+  effort: 1
+
+# 15. ENUM
+- ruleID: location-type-ENUM
+  message: "ENUM location test: {{name}}"
+  when:
+    java.referenced:
+      pattern: "*"
+      location: ENUM
+  category: mandatory
+  effort: 1

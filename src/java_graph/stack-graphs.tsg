@@ -1,0 +1,298 @@
+;; -*- coding: utf-8 -*-
+;; ------------------------------------------------------------------------------------------------
+;; Stack graphs definition for Java
+;; ------------------------------------------------------------------------------------------------
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Global Variables
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+global FILE_PATH           ; project relative path of this file
+global PROJECT_NAME = ""   ; project name, used to isolate different projects
+global ROOT_PATH = ""      ; path to the project root directory
+
+global SOURCE_TYPE_NODE
+global JUMP_TO_SCOPE_NODE
+global ROOT_NODE
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Attribute Shorthands
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+attribute node_definition = node        => type = "pop_symbol", node_symbol = node, is_definition
+attribute node_reference = node         => type = "push_symbol", node_symbol = node, is_reference
+attribute pop_node = node               => type = "pop_symbol", node_symbol = node
+attribute pop_scoped_node = node        => type = "pop_scoped_symbol", node_symbol = node
+attribute pop_scoped_symbol = symbol    => type = "pop_scoped_symbol", symbol = symbol
+attribute pop_symbol = symbol           => type = "pop_symbol", symbol = symbol
+attribute push_node = node              => type = "push_symbol", node_symbol = node
+attribute push_scoped_node = node       => type = "push_scoped_symbol", node_symbol = node
+attribute push_scoped_symbol = symbol   => type = "push_scoped_symbol", symbol = symbol
+attribute push_symbol = symbol          => type = "push_symbol", symbol = symbol
+attribute scoped_node_definition = node => type = "pop_scoped_symbol", node_symbol = node, is_definition
+attribute scoped_node_reference = node  => type = "push_scoped_symbol", node_symbol = node, is_reference
+attribute symbol_definition = symbol    => type = "pop_symbol", symbol = symbol, is_definition
+attribute symbol_reference = symbol     => type = "push_symbol", symbol = symbol, is_reference
+
+attribute node_symbol = node            => symbol = (source-text node), source_node = node
+attribute fqdn_edge = edge => precedence = 10
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Root Program
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(program) @program {
+  node @program.def
+  attr (@program.def) type = "pop_symbol", symbol = FILE_PATH, source_node = @program, is_definition, syntax_type = "program"
+  edge SOURCE_TYPE_NODE -> @program.def
+  edge ROOT_NODE -> SOURCE_TYPE_NODE
+}
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Package Declaration
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(package_declaration
+  [
+    (identifier) @name
+    (scoped_identifier) @name
+  ]
+) @package {
+  node @package.def
+  node @package.lexical_scope
+  attr (@package.def) type = "pop_symbol", symbol = (source-text @name), source_node = @package, is_definition, syntax_type = "package"
+}
+
+(program
+  (package_declaration)? @package
+) @program {
+  if some @package {
+    edge @program.def -> @package.def
+  }
+}
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Import Declarations
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+; NOTE: Import declarations are queried via TypeResolver, not stack-graph.
+; No TSG rules needed for Phase 1.
+; TODO Phase 2: Add stack-graph rules for import path resolution if needed.
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Class Declaration
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(class_declaration
+  name: (identifier) @classname
+) @class_declaration {
+  node @class_declaration.def
+  node @class_declaration.lexical_scope
+
+  attr (@class_declaration.def) type = "pop_symbol", symbol = (source-text @classname), source_node = @class_declaration, is_definition, syntax_type = "class"
+}
+
+; Connect class to program and package
+(program
+  (package_declaration) @package
+  (class_declaration) @class_declaration
+) @program {
+  edge @program.def -> @class_declaration.def
+  edge @class_declaration.def -> @package.def
+  attr (@class_declaration.def -> @package.def) fqdn_edge
+  edge @class_declaration.lexical_scope -> @package.lexical_scope
+}
+
+; Connect class to program when no package
+(program
+  (class_declaration) @class_declaration
+) @program {
+  edge @program.def -> @class_declaration.def
+}
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Field Declaration
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(field_declaration
+  declarator: (variable_declarator
+    name: (identifier) @field_name
+  )
+) @field_declaration {
+  node @field_declaration.def
+  attr (@field_declaration.def) type = "pop_symbol", symbol = (source-text @field_name), source_node = @field_declaration, is_definition, syntax_type = "field"
+}
+
+(class_declaration
+  body: (class_body
+    (field_declaration) @field_declaration
+  )
+) @class_declaration {
+  edge @class_declaration.def -> @field_declaration.def
+  edge @field_declaration.def -> @class_declaration.def
+  attr (@field_declaration.def -> @class_declaration.def) fqdn_edge
+}
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Method Declaration
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(method_declaration
+  name: (identifier) @method_name
+) @method_declaration {
+  node @method_declaration.def
+  node @method_declaration.lexical_scope
+
+  attr (@method_declaration.def) type = "pop_symbol", symbol = (source-text @method_name), source_node = @method_declaration, is_definition, syntax_type = "method"
+}
+
+(class_declaration
+  body: (class_body
+    (method_declaration) @method_declaration
+  )
+) @class_declaration {
+  edge @class_declaration.def -> @method_declaration.def
+  edge @method_declaration.def -> @class_declaration.def
+  attr (@method_declaration.def -> @class_declaration.def) fqdn_edge
+}
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Constructor Declaration
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(constructor_declaration
+  name: (identifier) @constructor_name
+) @constructor_declaration {
+  node @constructor_declaration.def
+  node @constructor_declaration.lexical_scope
+
+  attr (@constructor_declaration.def) type = "pop_symbol", symbol = (source-text @constructor_name), source_node = @constructor_declaration, is_definition, syntax_type = "constructor"
+}
+
+(class_declaration
+  body: (class_body
+    (constructor_declaration) @constructor_declaration
+  )
+) @class_declaration {
+  edge @class_declaration.def -> @constructor_declaration.def
+  edge @constructor_declaration.def -> @class_declaration.def
+  attr (@constructor_declaration.def -> @class_declaration.def) fqdn_edge
+}
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Inheritance (extends clause)
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(class_declaration
+  superclass: (superclass
+    (type_identifier) @parent_type
+  )
+) @class_declaration {
+  node @class_declaration.parent_ref
+  attr (@class_declaration.parent_ref) type = "push_symbol", symbol = (source-text @parent_type), source_node = @class_declaration, is_reference, syntax_type = "inheritance"
+  edge @class_declaration.def -> @class_declaration.parent_ref
+}
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Interface Implementation (implements clause)
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(class_declaration
+  interfaces: (super_interfaces
+    (type_list
+      (type_identifier) @interface_type
+    )
+  )
+) @class_declaration {
+  node @interface_type.ref
+  attr (@interface_type.ref) type = "push_symbol", symbol = (source-text @interface_type), source_node = @class_declaration, is_reference, syntax_type = "implements_type"
+  edge @class_declaration.def -> @interface_type.ref
+}
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Method Invocations
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+; Method invocation: captures method name
+(method_invocation
+  name: (identifier) @method_name
+) @method_invocation {
+  node @method_invocation.def
+  attr (@method_invocation.def) type = "push_symbol", symbol = (source-text @method_name), source_node = @method_invocation, is_reference, syntax_type = "method_call"
+}
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Constructor Calls (object creation expressions)
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+; Constructor call with type_identifier: new User()
+(object_creation_expression
+  type: (type_identifier) @type
+) @object_creation {
+  node @object_creation.def
+  attr (@object_creation.def) type = "push_symbol", symbol = (source-text @type), source_node = @object_creation, is_reference, syntax_type = "constructor_call"
+}
+
+; Constructor call with generic type: new ArrayList<>()
+(object_creation_expression
+  type: (generic_type
+    (type_identifier) @type
+  )
+) @object_creation {
+  node @object_creation.generic_def
+  attr (@object_creation.generic_def) type = "push_symbol", symbol = (source-text @type), source_node = @object_creation, is_reference, syntax_type = "constructor_call"
+}
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Annotations
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+; Marker annotation: @Service, @Override
+(marker_annotation
+  name: (identifier) @annotation_name
+) @marker_annotation {
+  node @marker_annotation.def
+  attr (@marker_annotation.def) type = "push_symbol", symbol = (source-text @annotation_name), source_node = @marker_annotation, is_reference, syntax_type = "annotation"
+}
+
+; Annotation with arguments: @Deprecated(since = "1.0")
+(annotation
+  name: (identifier) @annotation_name
+) @annotation {
+  node @annotation.def
+  attr (@annotation.def) type = "push_symbol", symbol = (source-text @annotation_name), source_node = @annotation, is_reference, syntax_type = "annotation"
+}
+
+; Connect annotations to class/method/field
+(class_declaration
+  (modifiers
+    [
+      (marker_annotation) @annotation
+      (annotation) @annotation
+    ]
+  )
+) @class_declaration {
+  edge @class_declaration.def -> @annotation.def
+}
+
+(method_declaration
+  (modifiers
+    [
+      (marker_annotation) @annotation
+      (annotation) @annotation
+    ]
+  )
+) @method_declaration {
+  edge @method_declaration.def -> @annotation.def
+}
+
+(field_declaration
+  (modifiers
+    [
+      (marker_annotation) @annotation
+      (annotation) @annotation
+    ]
+  )
+) @field_declaration {
+  edge @field_declaration.def -> @annotation.def
+}
