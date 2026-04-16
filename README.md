@@ -1,16 +1,16 @@
 # Java Analyzer Provider
 
-A self-contained Rust-based Java static code analyzer provider for the Konveyor migration platform.
+A high-performance Rust-based Java static code analyzer provider for the Konveyor migration platform.
 
 ## Overview
 
-This provider eliminates the JDTLS (Eclipse Language Server) dependency while maintaining 100% API compatibility with the existing Go-based Java provider. It uses:
+This provider delivers fast, accurate Java code analysis without requiring JDTLS (Eclipse Language Server) or a JVM runtime. It uses:
 
 - **tree-sitter-java**: Fast, incremental Java parsing
 - **stack-graphs**: GitHub's semantic code navigation technology
 - **TypeResolver**: Custom semantic layer for inheritance/implements tracking
 - **Maven/Gradle integration**: Full dependency tree analysis
-- **Pure Rust**: Self-contained binary, no JVM required (except for FernFlower decompilation)
+- **Pure Rust**: Self-contained binary with minimal dependencies
 
 ## Architecture
 
@@ -155,8 +155,6 @@ For more details, see [docs/docker.md](docs/docker.md).
 
 ## Development
 
-See [docs/phase-2-completion-summary.md](docs/phase-2-completion-summary.md) for the complete Phase 2 implementation summary.
-
 ### Project Structure
 
 ```
@@ -203,49 +201,28 @@ See [e2e-tests/README.md](e2e-tests/README.md) for comprehensive E2E testing gui
 
 ## Documentation
 
-### Task Completion Summaries
-- [Phase 2 Complete](docs/phase-2-completion-summary.md) - Overall Phase 2 summary
-- [Task 2.6: gRPC Interface](docs/task-2.6-completion-summary.md)
-- [Task 2.7: Maven Dependencies](docs/task-2.7-completion-summary.md)
-- [Task 2.8: Gradle Dependencies](docs/task-2.8-completion-summary.md)
-- [Task 2.9: Performance Optimization](docs/task-2.9-completion-summary.md)
-- [Task 2.10: Enhanced Pattern Matching](docs/task-2.10-completion-summary.md)
+- [Docker Guide](docs/docker.md) - Comprehensive Docker/Podman deployment guide
+- [E2E Testing](e2e-tests/README.md) - End-to-end testing with konveyor-analyzer
 
-### Setup & Deployment
-- [Docker Setup](docs/docker.md) - Comprehensive Docker/Podman guide
-- [Docker Setup Complete](docs/docker-setup-completion.md) - Implementation summary
+## Features
 
-### Testing
-- [E2E Testing Guide](e2e-tests/README.md) - End-to-end testing with konveyor-analyzer
-- [E2E Testing Setup](docs/e2e-testing-setup-completion.md) - E2E infrastructure implementation
-
-## Status
-
-✅ **Phase 2 Complete** - Production ready for Konveyor deployment!
-
-### Completed
-- ✅ Phase 1: Core Analysis Engine (tree-sitter, stack-graphs, TypeResolver, Query Engine)
-- ✅ Phase 2: Service Integration (gRPC, Maven, Gradle, Performance, Patterns)
-- ✅ Docker/Podman containerization (Production + Test images)
-
-### Test Coverage
-- **191 tests passing** across all modules
-- Unit tests, integration tests, pattern matching tests
-- Maven and Gradle dependency resolution tests
-
-### In Progress
-- 🔨 Phase 3: Advanced Features (planned)
-
-### Features
 - ✅ Full gRPC ProviderService implementation
 - ✅ 15 location types supported
-- ✅ Maven dependency resolution (pom.xml + mvn)
-- ✅ Gradle dependency resolution (build.gradle/.kts + gradle)
-- ✅ Incremental file updates (500x faster)
-- ✅ Advanced pattern matching (AND/OR/NOT, case-insensitive)
-- ✅ Pattern caching (100x faster compilation)
-- ✅ Progress streaming
+- ✅ Annotation filtering with element regex matching
+- ✅ Maven dependency resolution (pom.xml + mvn dependency:tree)
+- ✅ Gradle dependency resolution (build.gradle/.kts + gradle dependencies)
+- ✅ Semantic version comparison and range matching
+- ✅ Advanced pattern matching (wildcards, regex, AND/OR/NOT)
+- ✅ Pattern caching for performance
+- ✅ Progress streaming for long operations
 - ✅ OpenShift-compatible containers
+
+## Test Coverage
+
+- **191+ unit tests** across all modules
+- Integration tests for Maven and Gradle
+- Pattern matching and annotation filtering tests
+- E2E tests with konveyor-analyzer (34/42 rules passing)
 
 ## License
 
