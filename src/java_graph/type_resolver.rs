@@ -66,6 +66,7 @@ pub struct ClassInfo {
     pub implements: Vec<String>,      // Interface names (simple names, to be resolved later)
     pub methods: Vec<MethodInfo>,
     pub fields: Vec<FieldInfo>,
+    pub annotations: Vec<AnnotationInfo>,  // Annotations on this class
     pub is_interface: bool,
     pub is_enum: bool,
     pub position: SourcePosition,
@@ -77,6 +78,7 @@ pub struct MethodInfo {
     pub name: String,
     pub return_type: String,          // Simple name or primitive
     pub parameters: Vec<(String, String)>,  // (param_name, type_name)
+    pub annotations: Vec<AnnotationInfo>,  // Annotations on this method
     pub position: SourcePosition,
 }
 
@@ -85,6 +87,7 @@ pub struct MethodInfo {
 pub struct FieldInfo {
     pub name: String,
     pub type_name: String,            // Simple name or primitive
+    pub annotations: Vec<AnnotationInfo>,  // Annotations on this field
     pub position: SourcePosition,
 }
 
@@ -120,6 +123,15 @@ pub enum AnnotationTarget {
     Field(String, String),              // (class name, field name)
     Parameter(String, String, String),  // (class name, method name, param name)
     Unknown,                            // Couldn't determine target
+}
+
+/// Detailed annotation information with elements
+#[derive(Debug, Clone)]
+pub struct AnnotationInfo {
+    pub name: String,                   // Annotation name (simple, e.g., "Inject")
+    pub fqdn: Option<String>,           // Resolved FQDN (e.g., "javax.inject.Inject")
+    pub elements: HashMap<String, String>,  // Annotation elements (e.g., {"name" => "id", "value" => "user_id"})
+    pub position: SourcePosition,
 }
 
 /// Information about a local variable declaration
@@ -234,6 +246,51 @@ impl TypeResolver {
                     if !interface_fqdns.is_empty() {
                         self.interface_map.insert(class_fqdn.clone(), interface_fqdns);
                     }
+                }
+            }
+        }
+    }
+
+    /// Resolve annotation FQDNs for all classes, methods, and fields
+    /// Should be called after build_global_index()
+    pub fn resolve_annotation_fqdns(&mut self) {
+        let file_paths: Vec<PathBuf> = self.file_infos.keys().cloned().collect();
+
+        for file_path in file_paths {
+            // We need to clone and modify to avoid borrow checker issues
+            if let Some(file_info) = self.file_infos.get(&file_path).cloned() {
+                let mut updated_classes = file_info.classes.clone();
+
+                for (class_name, class_info) in &mut updated_classes {
+                    // Resolve class annotations
+                    for annotation in &mut class_info.annotations {
+                        if annotation.fqdn.is_none() {
+                            annotation.fqdn = self.resolve_type_name(&annotation.name, &file_path);
+                        }
+                    }
+
+                    // Resolve method annotations
+                    for method in &mut class_info.methods {
+                        for annotation in &mut method.annotations {
+                            if annotation.fqdn.is_none() {
+                                annotation.fqdn = self.resolve_type_name(&annotation.name, &file_path);
+                            }
+                        }
+                    }
+
+                    // Resolve field annotations
+                    for field in &mut class_info.fields {
+                        for annotation in &mut field.annotations {
+                            if annotation.fqdn.is_none() {
+                                annotation.fqdn = self.resolve_type_name(&annotation.name, &file_path);
+                            }
+                        }
+                    }
+                }
+
+                // Update the file_info with resolved annotations
+                if let Some(file_info_mut) = self.file_infos.get_mut(&file_path) {
+                    file_info_mut.classes = updated_classes;
                 }
             }
         }
@@ -629,6 +686,140 @@ fn extract_annotation_info(
     })
 }
 
+/// Extract detailed annotation information with elements from an annotation node
+fn extract_detailed_annotation(
+    annotation_node: tree_sitter::Node,
+    source: &str,
+) -> Option<AnnotationInfo> {
+    let mut annotation_name = String::new();
+    let mut elements = HashMap::new();
+
+    // Get annotation name
+    if let Some(name_node) = annotation_node.child_by_field_name("name") {
+        annotation_name = ast_explorer::node_text(name_node, source).to_string();
+    } else {
+        // Try to find first identifier or scoped_identifier child
+        for child in annotation_node.children(&mut annotation_node.walk()) {
+            if child.kind() == "identifier" || child.kind() == "scoped_identifier" || child.kind() == "type_identifier" {
+                annotation_name = ast_explorer::node_text(child, source).to_string();
+                break;
+            }
+        }
+    }
+
+    // Strip @ symbol if present
+    annotation_name = annotation_name.trim_start_matches('@').to_string();
+
+    if annotation_name.is_empty() {
+        return None;
+    }
+
+    // Extract annotation elements/arguments
+    if let Some(arguments_node) = annotation_node.child_by_field_name("arguments") {
+        elements = extract_annotation_elements(arguments_node, source);
+    }
+
+    Some(AnnotationInfo {
+        name: annotation_name,
+        fqdn: None,  // Will be resolved later
+        elements,
+        position: SourcePosition::from_node(annotation_node),
+    })
+}
+
+/// Extract annotation elements (name-value pairs) from annotation arguments
+fn extract_annotation_elements(
+    arguments_node: tree_sitter::Node,
+    source: &str,
+) -> HashMap<String, String> {
+    let mut elements = HashMap::new();
+
+    for child in arguments_node.children(&mut arguments_node.walk()) {
+        if child.kind() == "element_value_pair" {
+            // Extract name and value from element_value_pair
+            let mut name = String::new();
+            let mut value = String::new();
+
+            for element_child in child.children(&mut child.walk()) {
+                match element_child.kind() {
+                    "identifier" => {
+                        if name.is_empty() {
+                            name = ast_explorer::node_text(element_child, source).to_string();
+                        }
+                    }
+                    "element_value_array_initializer" | "array_initializer" => {
+                        // Handle array values like {... }
+                        // Extract the first string literal from the array
+                        for array_child in element_child.children(&mut element_child.walk()) {
+                            if array_child.kind() == "string_literal" {
+                                value = ast_explorer::node_text(array_child, source).to_string();
+                                break;  // Take first element only
+                            }
+                        }
+                    }
+                    "string_literal" | "decimal_integer_literal" | "boolean_literal" => {
+                        // Direct value (not an array)
+                        value = ast_explorer::node_text(element_child, source).to_string();
+                    }
+                    _ if !element_child.kind().contains("(") && !element_child.kind().contains(")") && !element_child.kind().contains("=") => {
+                        // This is likely the value (fallback)
+                        if value.is_empty() {
+                            value = ast_explorer::node_text(element_child, source).to_string();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            if !name.is_empty() && !value.is_empty() {
+                // Clean up quotes from string values
+                let cleaned_value = value.trim_matches('"').to_string();
+                elements.insert(name, cleaned_value);
+            }
+        } else if child.kind() == "string_literal" || child.kind() == "identifier" || child.kind() == "decimal_integer_literal" || child.kind() == "boolean_literal" {
+            // Single value annotation like @SuppressWarnings("unused")
+            // Use "value" as the default key
+            let value_text = ast_explorer::node_text(child, source);
+            let cleaned_value = value_text.trim_matches('"').to_string();
+            elements.insert("value".to_string(), cleaned_value);
+        }
+    }
+
+    elements
+}
+
+/// Extract annotations from a node's children (looks for modifiers node containing annotations)
+fn extract_annotations_from_node(
+    parent_node: tree_sitter::Node,
+    source: &str,
+) -> Vec<AnnotationInfo> {
+    let mut annotations = Vec::new();
+
+    // Look through all children for annotations
+    for child in parent_node.children(&mut parent_node.walk()) {
+        match child.kind() {
+            "marker_annotation" | "annotation" => {
+                if let Some(annotation) = extract_detailed_annotation(child, source) {
+                    annotations.push(annotation);
+                }
+            }
+            "modifiers" => {
+                // Modifiers node contains annotations
+                for modifier_child in child.children(&mut child.walk()) {
+                    if modifier_child.kind() == "marker_annotation" || modifier_child.kind() == "annotation" {
+                        if let Some(annotation) = extract_detailed_annotation(modifier_child, source) {
+                            annotations.push(annotation);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    annotations
+}
+
 /// Determine what an annotation is targeting
 fn determine_annotation_target(
     annotation_node: tree_sitter::Node,
@@ -902,6 +1093,7 @@ fn extract_class_info(
     let mut implements = Vec::new();
     let mut methods = Vec::new();
     let mut fields = Vec::new();
+    let annotations = extract_annotations_from_node(class_node, source);
 
     for child in class_node.children(&mut class_node.walk()) {
         match child.kind() {
@@ -956,6 +1148,7 @@ fn extract_class_info(
         implements,
         methods,
         fields,
+        annotations,
         is_interface,
         is_enum,
         position: SourcePosition::from_node(class_node),
@@ -1009,6 +1202,7 @@ fn extract_types_from_interfaces(interfaces_node: tree_sitter::Node, source: &st
 fn extract_field_info(field_node: tree_sitter::Node, source: &str) -> Option<FieldInfo> {
     let mut type_name = String::new();
     let mut field_name = String::new();
+    let annotations = extract_annotations_from_node(field_node, source);
 
     for child in field_node.children(&mut field_node.walk()) {
         match child.kind() {
@@ -1042,6 +1236,7 @@ fn extract_field_info(field_node: tree_sitter::Node, source: &str) -> Option<Fie
         Some(FieldInfo {
             name: field_name,
             type_name,
+            annotations,
             position: SourcePosition::from_node(field_node),
         })
     } else {
@@ -1054,6 +1249,7 @@ fn extract_method_info(method_node: tree_sitter::Node, source: &str) -> Option<M
     let mut method_name = String::new();
     let mut return_type = String::new();
     let mut parameters = Vec::new();
+    let annotations = extract_annotations_from_node(method_node, source);
 
     for child in method_node.children(&mut method_node.walk()) {
         match child.kind() {
@@ -1089,6 +1285,7 @@ fn extract_method_info(method_node: tree_sitter::Node, source: &str) -> Option<M
             name: method_name,
             return_type,
             parameters,
+            annotations,
             position: SourcePosition::from_node(method_node),
         })
     } else {
@@ -1103,6 +1300,7 @@ fn extract_constructor_info(
     class_name: &str,
 ) -> Option<MethodInfo> {
     let mut parameters = Vec::new();
+    let annotations = extract_annotations_from_node(ctor_node, source);
 
     for child in ctor_node.children(&mut ctor_node.walk()) {
         if child.kind() == "formal_parameters" {
@@ -1114,6 +1312,7 @@ fn extract_constructor_info(
         name: class_name.to_string(),  // Constructor name is the class name
         return_type: String::new(),     // Constructors have no return type
         parameters,
+        annotations,
         position: SourcePosition::from_node(ctor_node),
     })
 }
@@ -1534,6 +1733,7 @@ mod tests {
                 implements: vec![],
                 methods: vec![],
                 fields: vec![],
+                annotations: vec![],
                 is_interface: false,
                 is_enum: false,
                 position: SourcePosition::unknown(),
@@ -1550,6 +1750,7 @@ mod tests {
                 implements: vec![],
                 methods: vec![],
                 fields: vec![],
+                annotations: vec![],
                 is_interface: false,
                 is_enum: false,
                 position: SourcePosition::unknown(),
@@ -1596,6 +1797,7 @@ mod tests {
                 implements: vec![],
                 methods: vec![],
                 fields: vec![],
+                annotations: vec![],
                 is_interface: false,
                 is_enum: false,
                 position: SourcePosition::unknown(),
@@ -1611,6 +1813,7 @@ mod tests {
                 implements: vec![],
                 methods: vec![],
                 fields: vec![],
+                annotations: vec![],
                 is_interface: false,
                 is_enum: false,
                 position: SourcePosition::unknown(),
@@ -1626,6 +1829,7 @@ mod tests {
                 implements: vec![],
                 methods: vec![],
                 fields: vec![],
+                annotations: vec![],
                 is_interface: false,
                 is_enum: false,
                 position: SourcePosition::unknown(),
@@ -1676,6 +1880,7 @@ mod tests {
                 implements: vec![],
                 methods: vec![],
                 fields: vec![],
+                annotations: vec![],
                 is_interface: false,
                 is_enum: false,
                 position: SourcePosition::unknown(),
@@ -1691,6 +1896,7 @@ mod tests {
                 implements: vec![],
                 methods: vec![],
                 fields: vec![],
+                annotations: vec![],
                 is_interface: false,
                 is_enum: false,
                 position: SourcePosition::unknown(),
@@ -1706,6 +1912,7 @@ mod tests {
                 implements: vec![],
                 methods: vec![],
                 fields: vec![],
+                annotations: vec![],
                 is_interface: false,
                 is_enum: false,
                 position: SourcePosition::unknown(),
@@ -1758,6 +1965,7 @@ mod tests {
                 implements: vec!["Runnable".to_string(), "Cloneable".to_string()],
                 methods: vec![],
                 fields: vec![],
+                annotations: vec![],
                 is_interface: false,
                 is_enum: false,
                 position: SourcePosition::unknown(),
@@ -1810,6 +2018,7 @@ mod tests {
                 implements: vec!["Runnable".to_string()],
                 methods: vec![],
                 fields: vec![],
+                annotations: vec![],
                 is_interface: false,
                 is_enum: false,
                 position: SourcePosition::unknown(),
@@ -1825,6 +2034,7 @@ mod tests {
                 implements: vec!["Cloneable".to_string()],
                 methods: vec![],
                 fields: vec![],
+                annotations: vec![],
                 is_interface: false,
                 is_enum: false,
                 position: SourcePosition::unknown(),
@@ -1879,6 +2089,7 @@ mod tests {
                 implements: vec!["Runnable".to_string()],
                 methods: vec![],
                 fields: vec![],
+                annotations: vec![],
                 is_interface: false,
                 is_enum: false,
                 position: SourcePosition::unknown(),
@@ -1894,6 +2105,7 @@ mod tests {
                 implements: vec!["Cloneable".to_string(), "Serializable".to_string()],
                 methods: vec![],
                 fields: vec![],
+                annotations: vec![],
                 is_interface: false,
                 is_enum: false,
                 position: SourcePosition::unknown(),
@@ -1926,5 +2138,61 @@ mod tests {
         assert!(interfaces.contains(&"java.lang.Cloneable".to_string()));
         assert!(interfaces.contains(&"java.io.Serializable".to_string()));
         assert!(interfaces.contains(&"java.lang.Runnable".to_string()));
+    }
+}
+
+#[cfg(test)]
+mod annotation_tests {
+    use super::*;
+    use crate::java_graph::language_config;
+
+    #[test]
+    fn test_annotation_with_array_element() {
+        let java_code = r#"
+package io.konveyor.demo.ordermanagement.config;
+
+import org.springframework.data.jpa.repository.config.EnableJpaRepositories;
+import org.springframework.context.annotation.Bean;
+
+@EnableJpaRepositories(basePackages = {
+        "io.konveyor.demo.ordermanagement.repository"
+})
+public class PersistenceConfig {
+    @Bean
+    public void entityManagerFactory() {}
+}
+"#;
+
+        // Parse the code
+        let tree = language_config::parse_source(java_code).unwrap();
+        let source = java_code;
+        
+        // Find class_declaration node
+        let class_nodes = ast_explorer::find_nodes_by_kind(&tree, "class_declaration");
+        assert!(!class_nodes.is_empty(), "Should find at least one class");
+        
+        let class_node = class_nodes[0];
+        
+        // Extract annotations from the class
+        let annotations = extract_annotations_from_node(class_node, &source);
+        
+        println!("Found {} annotations", annotations.len());
+        for ann in &annotations {
+            println!("Annotation: {} (FQDN: {:?})", ann.name, ann.fqdn);
+            println!("  Elements: {:?}", ann.elements);
+        }
+        
+        // Should have @EnableJpaRepositories annotation
+        let enable_jpa = annotations.iter()
+            .find(|a| a.name == "EnableJpaRepositories")
+            .expect("Should find EnableJpaRepositories annotation");
+        
+        // Check if basePackages element was extracted
+        assert!(enable_jpa.elements.contains_key("basePackages"), 
+            "Should have basePackages element");
+        
+        let base_packages = &enable_jpa.elements["basePackages"];
+        assert_eq!(base_packages, "io.konveyor.demo.ordermanagement.repository",
+            "basePackages should match");
     }
 }

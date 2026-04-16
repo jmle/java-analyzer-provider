@@ -13,7 +13,7 @@ import org.springframework.web.servlet.ViewResolver;
 @Configuration
 public class TilesConfig {
 
-    @Bean(name = "nameForThisBean")
+    @Bean(name = "nameForThisBean", autowireCandidate = false)
     public TilesConfigurer tilesConfigurer() {
         TilesConfigurer tilesConfigurer = new TilesConfigurer();
         tilesConfigurer.setDefinitions("/WEB-INF/tiles/tiles-definitions.xml");

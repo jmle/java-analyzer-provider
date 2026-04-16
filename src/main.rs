@@ -44,9 +44,10 @@ async fn main() -> anyhow::Result<()> {
     let addr = format!("0.0.0.0:{}", port).parse()?;
     info!("Starting gRPC server on {}", addr);
 
-    // Create provider instances (they share state via Arc internally, so cloning is cheap)
+    // Create provider instances with shared state
     let java_provider1 = JavaProvider::new();
-    let java_provider2 = JavaProvider::new();
+    let shared_state = java_provider1.get_shared_state();
+    let java_provider2 = JavaProvider::new_with_shared_state(shared_state);
 
     // Load file descriptor set for reflection
     let file_descriptor_set = include_bytes!("analyzer_service/provider_service_descriptor.bin");

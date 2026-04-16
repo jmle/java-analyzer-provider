@@ -42,7 +42,10 @@ pub struct ConditionWrapper {
     pub template: HashMap<String, serde_json::Value>,
     #[serde(default, rename = "ruleID")]
     pub rule_id: String,
-    pub referenced: ReferencedCondition,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub referenced: Option<ReferencedCondition>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dependency: Option<DependencyCondition>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -77,22 +80,86 @@ pub struct AnnotationElement {
     pub value: String,
 }
 
+/// Dependency matching condition (for java.dependency capability)
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DependencyCondition {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lowerbound: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upperbound: Option<String>,
+}
+
+/// Semantic version comparison
+/// Returns -1 if v1 < v2, 0 if v1 == v2, 1 if v1 > v2
+fn compare_versions(v1: &str, v2: &str) -> i32 {
+    let parse_version = |v: &str| -> Vec<u32> {
+        v.split('.')
+            .filter_map(|part| part.parse::<u32>().ok())
+            .collect()
+    };
+
+    let parts1 = parse_version(v1);
+    let parts2 = parse_version(v2);
+
+    let max_len = parts1.len().max(parts2.len());
+
+    for i in 0..max_len {
+        let p1 = parts1.get(i).copied().unwrap_or(0);
+        let p2 = parts2.get(i).copied().unwrap_or(0);
+
+        if p1 < p2 {
+            return -1;
+        } else if p1 > p2 {
+            return 1;
+        }
+    }
+
+    0
+}
+
+/// Check if a version is within the specified bounds (inclusive)
+fn version_in_range(version: &str, lowerbound: Option<&str>, upperbound: Option<&str>) -> bool {
+    if let Some(lower) = lowerbound {
+        if compare_versions(version, lower) < 0 {
+            return false;
+        }
+    }
+
+    if let Some(upper) = upperbound {
+        if compare_versions(version, upper) > 0 {
+            return false;
+        }
+    }
+
+    true
+}
+
 /// State of the Java provider
-pub struct JavaProviderState {
-    config: Option<Config>,
-    type_resolver: Option<TypeResolver>,
+/// State for a single provider instance (one Init call)
+#[derive(Clone)]
+pub struct ProviderInstanceState {
+    config: Config,
+    source_path: PathBuf,
     initialized: bool,
-    source_path: Option<PathBuf>,
-    java_files: Vec<PathBuf>,          // Track analyzed files for incremental updates
+}
+
+/// Global provider state managing multiple instances
+pub struct JavaProviderState {
+    instances: HashMap<i64, ProviderInstanceState>,
+    next_id: i64,
+    // Global type resolver shared across all instances
+    type_resolver: Option<TypeResolver>,
+    java_files: Vec<PathBuf>,
 }
 
 impl JavaProviderState {
     pub fn new() -> Self {
         Self {
-            config: None,
+            instances: HashMap::new(),
+            next_id: 1,
             type_resolver: None,
-            initialized: false,
-            source_path: None,
             java_files: Vec::new(),
         }
     }
@@ -112,6 +179,17 @@ impl JavaProvider {
         }
     }
 
+    /// Create a new provider instance that shares state with another
+    pub fn new_with_shared_state(state: Arc<RwLock<JavaProviderState>>) -> Self {
+        info!("Creating JavaProvider instance with shared state");
+        Self { state }
+    }
+
+    /// Get a reference to the shared state (for creating additional instances)
+    pub fn get_shared_state(&self) -> Arc<RwLock<JavaProviderState>> {
+        Arc::clone(&self.state)
+    }
+
     /// Parse location type from string
     fn parse_location_type(location: &str) -> Result<LocationType> {
         match location.to_lowercase().as_str() {
@@ -129,6 +207,276 @@ impl JavaProvider {
             "variable" | "variable_declaration" | "variabledeclaration" => Ok(LocationType::Variable),
             "return_type" | "returntype" => Ok(LocationType::ReturnType),
             _ => anyhow::bail!("Unknown location type: {}", location),
+        }
+    }
+
+    /// Evaluate a dependency condition
+    async fn evaluate_dependency_condition(
+        &self,
+        dependency_cond: &DependencyCondition,
+        source_path: &Path,
+    ) -> std::result::Result<Response<EvaluateResponse>, Status> {
+        info!("Evaluating dependency condition: name={} for path={}", dependency_cond.name, source_path.display());
+
+        // Convert dot notation to colon notation (junit.junit -> junit:junit)
+        let target_name = dependency_cond.name.replace('.', ":");
+
+        let mut incidents = Vec::new();
+
+        // Check Maven dependencies
+        let pom_files = find_pom_files(&source_path)
+            .map_err(|e| Status::internal(format!("Failed to find pom files: {}", e)))?;
+
+        for pom_path in pom_files {
+            if let Ok(deps) = self.get_maven_dependencies_with_lines(&pom_path).await {
+                for (dep, line_num) in deps {
+                    let dep_name = format!("{}:{}", dep.group_id, dep.artifact_id);
+
+                    if dep_name == target_name {
+                        if let Some(ref version) = dep.version {
+                            // Check version bounds
+                            if version_in_range(
+                                version,
+                                dependency_cond.lowerbound.as_deref(),
+                                dependency_cond.upperbound.as_deref(),
+                            ) {
+                                incidents.push(self.create_dependency_incident(
+                                    &pom_path,
+                                    line_num,
+                                    &dependency_cond.name,
+                                    version,
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Check Gradle dependencies
+        let gradle_files = find_gradle_files(&source_path)
+            .map_err(|e| Status::internal(format!("Failed to find gradle files: {}", e)))?;
+
+        for gradle_file in gradle_files {
+            if let Ok(deps) = self.get_gradle_dependencies_with_lines(&gradle_file).await {
+                for (dep, line_num) in deps {
+                    let dep_name = format!("{}:{}", dep.group_id, dep.artifact_id);
+
+                    if dep_name == target_name {
+                        if let Some(ref version) = dep.version {
+                            if version_in_range(
+                                version,
+                                dependency_cond.lowerbound.as_deref(),
+                                dependency_cond.upperbound.as_deref(),
+                            ) {
+                                incidents.push(self.create_dependency_incident(
+                                    &gradle_file,
+                                    line_num,
+                                    &dependency_cond.name,
+                                    version,
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let matched = !incidents.is_empty();
+        info!("Dependency condition matched: {} incidents found", incidents.len());
+
+        Ok(Response::new(EvaluateResponse {
+            error: String::new(),
+            successful: true,
+            response: Some(ProviderEvaluateResponse {
+                matched,
+                incident_contexts: incidents,
+                template_context: None,
+            }),
+        }))
+    }
+
+    /// Get Maven dependencies with their line numbers from a pom.xml file
+    async fn get_maven_dependencies_with_lines(&self, pom_path: &Path) -> Result<Vec<(crate::buildtool::maven::MavenDependency, u32)>> {
+        use crate::buildtool::maven::MavenPom;
+        use quick_xml::events::Event;
+        use quick_xml::Reader;
+        use std::fs::read_to_string;
+
+        let pom = MavenPom::parse(pom_path)?;
+        let xml_content = read_to_string(pom_path)?;
+
+        let mut deps_with_lines = Vec::new();
+        let mut reader = Reader::from_str(&xml_content);
+        reader.config_mut().trim_text(true);
+
+        let mut in_dependency = false;
+        let mut current_element = String::new();
+        let mut current_group_id = String::new();
+        let mut current_artifact_id = String::new();
+        let mut current_version = None;
+        let mut dependency_start_line = 0u32;
+
+        // Track line numbers by counting newlines in the raw text
+        let mut current_line = 1u32;
+
+        let mut buf = Vec::new();
+        loop {
+            let event_pos = reader.buffer_position() as usize;
+            // Count newlines up to current position
+            let content_bytes = xml_content.as_bytes();
+            if event_pos < content_bytes.len() {
+                current_line = content_bytes[..event_pos].iter().filter(|&&b| b == b'\n').count() as u32 + 1;
+            }
+
+            match reader.read_event_into(&mut buf) {
+                Ok(Event::Start(e)) => {
+                    let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                    if name == "dependency" {
+                        in_dependency = true;
+                        dependency_start_line = current_line;
+                        current_group_id.clear();
+                        current_artifact_id.clear();
+                        current_version = None;
+                    } else if in_dependency {
+                        current_element = name;
+                    }
+                }
+                Ok(Event::Text(e)) => {
+                    if in_dependency && !current_element.is_empty() {
+                        let text = e.unescape().unwrap_or_default().to_string();
+                        let resolved_text = pom.resolve_version(&text);
+
+                        match current_element.as_str() {
+                            "groupId" => current_group_id = resolved_text,
+                            "artifactId" => current_artifact_id = resolved_text,
+                            "version" => current_version = Some(resolved_text),
+                            _ => {}
+                        }
+                    }
+                }
+                Ok(Event::End(e)) => {
+                    let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                    if name == "dependency" && in_dependency {
+                        // Found a complete dependency
+                        if !current_group_id.is_empty() && !current_artifact_id.is_empty() {
+                            deps_with_lines.push((
+                                crate::buildtool::maven::MavenDependency {
+                                    group_id: current_group_id.clone(),
+                                    artifact_id: current_artifact_id.clone(),
+                                    version: current_version.clone(),
+                                    scope: None,
+                                    classifier: None,
+                                    type_: None,
+                                    optional: false,
+                                },
+                                dependency_start_line,
+                            ));
+                        }
+                        in_dependency = false;
+                    } else if in_dependency && name == current_element {
+                        current_element.clear();
+                    }
+                }
+                Ok(Event::Eof) => break,
+                Err(e) => {
+                    warn!("Error parsing pom.xml at position {}: {:?}", reader.buffer_position(), e);
+                    break;
+                }
+                _ => {}
+            }
+            buf.clear();
+        }
+
+        Ok(deps_with_lines)
+    }
+
+    /// Get Gradle dependencies with their line numbers from a build.gradle file
+    async fn get_gradle_dependencies_with_lines(&self, gradle_path: &Path) -> Result<Vec<(crate::buildtool::maven::MavenDependency, u32)>> {
+        use std::fs::read_to_string;
+        use regex::Regex;
+
+        let content = read_to_string(gradle_path)?;
+        let mut deps_with_lines = Vec::new();
+
+        // Match patterns like: compile 'junit:junit:4.12' or implementation "io.fabric8:kubernetes-client:6.0.0"
+        let dep_regex = Regex::new(r#"(?m)^\s*(?:compile|implementation|testImplementation|api|testCompile)\s+['"]([^:'"]+):([^:'"]+):([^'"]+)['"]"#)?;
+
+        for (line_num, line) in content.lines().enumerate() {
+            if let Some(caps) = dep_regex.captures(line) {
+                let group_id = caps.get(1).map(|m| m.as_str().to_string()).unwrap_or_default();
+                let artifact_id = caps.get(2).map(|m| m.as_str().to_string()).unwrap_or_default();
+                let version = caps.get(3).map(|m| m.as_str().to_string());
+
+                if !group_id.is_empty() && !artifact_id.is_empty() {
+                    deps_with_lines.push((
+                        crate::buildtool::maven::MavenDependency {
+                            group_id,
+                            artifact_id,
+                            version,
+                            scope: None,
+                            classifier: None,
+                            type_: None,
+                            optional: false,
+                        },
+                        (line_num + 1) as u32,
+                    ));
+                }
+            }
+        }
+
+        Ok(deps_with_lines)
+    }
+
+    /// Extract code snippet around a line number
+    fn extract_code_snippet(file_path: &Path, line_num: u32, before: usize, after: usize) -> String {
+        use std::fs::read_to_string;
+
+        let content = match read_to_string(file_path) {
+            Ok(c) => c,
+            Err(_) => return String::new(),
+        };
+
+        let lines: Vec<&str> = content.lines().collect();
+        let target_line = (line_num as usize).saturating_sub(1);
+
+        let start = target_line.saturating_sub(before);
+        let end = (target_line + after + 1).min(lines.len());
+
+        let mut snippet = String::new();
+        for (i, line) in lines[start..end].iter().enumerate() {
+            let line_number = start + i + 1;
+            if line_number == line_num as usize {
+                snippet.push_str(&format!(">>> {:3} | {}\n", line_number, line));
+            } else {
+                snippet.push_str(&format!("    {:3} | {}\n", line_number, line));
+            }
+        }
+
+        snippet
+    }
+
+    /// Create an incident for a matched dependency
+    fn create_dependency_incident(&self, file_path: &Path, line_num: u32, dep_name: &str, version: &str) -> IncidentContext {
+        use prost_types::{Struct, Value};
+
+        // Create variables for template substitution
+        let mut fields = std::collections::BTreeMap::new();
+        fields.insert("name".to_string(), Value {
+            kind: Some(prost_types::value::Kind::StringValue(dep_name.to_string())),
+        });
+        fields.insert("version".to_string(), Value {
+            kind: Some(prost_types::value::Kind::StringValue(version.to_string())),
+        });
+
+        IncidentContext {
+            file_uri: format!("file://{}", file_path.display()),
+            effort: None,
+            code_location: None,
+            line_number: Some(line_num as i64),
+            variables: Some(Struct { fields }),
+            links: vec![],
+            is_dependency_incident: true,
         }
     }
 
@@ -209,20 +557,20 @@ impl ProviderService for JavaProvider {
             }));
         }
 
-        // Store configuration
-        state.config = Some(config.clone());
-        state.source_path = Some(source_path.clone());
+        // Create new instance with unique ID
+        let instance_id = state.next_id;
+        state.next_id += 1;
 
-        // Create TypeResolver and analyze files
-        let mut type_resolver = TypeResolver::new();
+        // Get or create TypeResolver (accumulate across multiple Init calls)
+        let mut type_resolver = state.type_resolver.take().unwrap_or_else(|| TypeResolver::new());
 
-        // Find all .java files
+        // Find all .java files in this location
         let java_files = Self::find_java_files(&source_path)
             .map_err(|e| Status::internal(format!("Failed to find Java files: {}", e)))?;
 
-        info!("Found {} Java files to analyze", java_files.len());
+        info!("Found {} Java files to analyze in {}", java_files.len(), config.location);
 
-        // Analyze each file
+        // Analyze each file and add to resolver
         for java_file in &java_files {
             match type_resolver.analyze_file(java_file) {
                 Ok(_) => debug!("Analyzed: {}", java_file.display()),
@@ -230,21 +578,33 @@ impl ProviderService for JavaProvider {
             }
         }
 
-        // Build global index
+        // Append to accumulated file list
+        state.java_files.extend(java_files);
+
+        // Rebuild global indices with ALL accumulated files
         type_resolver.build_global_index();
         type_resolver.build_inheritance_maps();
+        type_resolver.resolve_annotation_fqdns();
 
-        info!("Analysis complete. Indexed {} files", type_resolver.file_infos.len());
+        info!("Analysis complete. Total indexed files: {}", type_resolver.file_infos.len());
 
-        // Store the resolver and file list (for incremental updates)
+        // Store the accumulated resolver back
         state.type_resolver = Some(type_resolver);
-        state.java_files = java_files;
-        state.initialized = true;
+
+        // Create and store instance state
+        let instance_state = ProviderInstanceState {
+            config: config.clone(),
+            source_path,
+            initialized: true,
+        };
+        state.instances.insert(instance_id, instance_state);
+
+        info!("Created provider instance with ID: {}", instance_id);
 
         Ok(Response::new(InitResponse {
             error: String::new(),
             successful: true,
-            id: 1,
+            id: instance_id,
             builtin_config: Some(config),
         }))
     }
@@ -265,8 +625,20 @@ impl ProviderService for JavaProvider {
 
         let state = self.state.read().await;
 
+        // Look up instance by ID
+        let instance = match state.instances.get(&req.id) {
+            Some(inst) => inst.clone(),
+            None => {
+                return Ok(Response::new(EvaluateResponse {
+                    error: format!("Unknown instance ID: {}", req.id),
+                    successful: false,
+                    response: None,
+                }));
+            }
+        };
+
         // Check if initialized
-        if !state.initialized {
+        if !instance.initialized {
             return Ok(Response::new(EvaluateResponse {
                 error: "Provider not initialized".to_string(),
                 successful: false,
@@ -275,9 +647,14 @@ impl ProviderService for JavaProvider {
         }
 
         // Parse the condition YAML (analyzer sends YAML format)
-        let condition_wrapper: ConditionWrapper = match serde_yaml::from_str(&req.condition_info) {
-            Ok(c) => c,
+        let condition_wrapper: ConditionWrapper = match serde_yaml::from_str::<ConditionWrapper>(&req.condition_info) {
+            Ok(c) => {
+                info!("Parsed condition - ruleID: {}, has_referenced: {}, has_dependency: {}",
+                      c.rule_id, c.referenced.is_some(), c.dependency.is_some());
+                c
+            },
             Err(e) => {
+                warn!("Failed to parse condition: {}", e);
                 return Ok(Response::new(EvaluateResponse {
                     error: format!("Failed to parse condition: {}", e),
                     successful: false,
@@ -286,7 +663,26 @@ impl ProviderService for JavaProvider {
             }
         };
 
-        let referenced = &condition_wrapper.referenced;
+        // Check which capability is being evaluated
+        if let Some(ref dependency_cond) = condition_wrapper.dependency {
+            // Handle java.dependency capability
+            info!("Handling dependency condition for rule: {}", condition_wrapper.rule_id);
+            let source_path = instance.source_path.clone();
+            drop(state); // Release lock before potentially long operation
+            return self.evaluate_dependency_condition(dependency_cond, &source_path).await;
+        }
+
+        // Handle java.referenced capability
+        let referenced = match &condition_wrapper.referenced {
+            Some(r) => r,
+            None => {
+                return Ok(Response::new(EvaluateResponse {
+                    error: "No referenced or dependency condition found".to_string(),
+                    successful: false,
+                    response: None,
+                }));
+            }
+        };
 
         // Parse location type
         let location_type = match Self::parse_location_type(&referenced.location) {
@@ -312,27 +708,41 @@ impl ProviderService for JavaProvider {
             }
         };
 
-        // Build query
-        // TODO: Enhance query module to support full AnnotatedCondition with elements
-        let annotated_pattern = referenced.annotated.as_ref().and_then(|a| a.pattern.clone());
+        // Build query with annotation filter if present
+        let annotation_filter = referenced.annotated.as_ref().map(|annotated_cond| {
+            use crate::java_graph::query::AnnotationFilter;
+            use std::collections::HashMap;
+
+            let mut elements = HashMap::new();
+            for element in &annotated_cond.elements {
+                elements.insert(element.name.clone(), element.value.clone());
+            }
+
+            tracing::debug!(
+                "Building annotation filter - pattern: {:?}, elements: {:?}",
+                annotated_cond.pattern,
+                elements
+            );
+
+            AnnotationFilter {
+                pattern: annotated_cond.pattern.clone(),
+                elements,
+            }
+        });
+
         let query = ReferencedQuery {
             pattern,
             location: location_type,
-            annotated: annotated_pattern,
+            annotated: annotation_filter,
             filters: None,  // Advanced filters not yet exposed via gRPC
         };
 
-        // Get type resolver and file list
+        // Get type resolver
         let type_resolver = state.type_resolver.as_ref().unwrap().clone();
-        let java_files = state.java_files.clone();
         drop(state); // Release read lock before potentially long operation
 
-        // Build graph (optimization: we don't re-analyze files, just rebuild graph structure)
-        let graph = loader::build_graph_for_files(&java_files.iter().map(|p| p.as_path()).collect::<Vec<_>>())
-            .map_err(|e| Status::internal(format!("Failed to build graph: {}", e)))?;
-
-        // Create query engine
-        let engine = QueryEngine::new(graph, type_resolver);
+        // Create query engine (no graph needed - all queries use TypeResolver)
+        let engine = QueryEngine::new(type_resolver);
 
         // Execute query
         let results = match engine.query(&query) {
@@ -373,14 +783,27 @@ impl ProviderService for JavaProvider {
 
     async fn get_dependencies(
         &self,
-        _request: Request<ServiceRequest>,
+        request: Request<ServiceRequest>,
     ) -> std::result::Result<Response<DependencyResponse>, Status> {
-        info!("GetDependencies requested");
+        let req = request.into_inner();
+        info!("GetDependencies requested for instance ID: {}", req.id);
 
         let state = self.state.read().await;
 
+        // Look up instance by ID
+        let instance = match state.instances.get(&req.id) {
+            Some(inst) => inst.clone(),
+            None => {
+                return Ok(Response::new(DependencyResponse {
+                    successful: false,
+                    error: format!("Unknown instance ID: {}", req.id),
+                    file_dep: vec![],
+                }));
+            }
+        };
+
         // Check if initialized
-        if !state.initialized {
+        if !instance.initialized {
             return Ok(Response::new(DependencyResponse {
                 successful: false,
                 error: "Provider not initialized".to_string(),
@@ -388,7 +811,7 @@ impl ProviderService for JavaProvider {
             }));
         }
 
-        let source_path = state.source_path.as_ref().unwrap().clone();
+        let source_path = instance.source_path.clone();
         drop(state); // Release lock
 
         // Detect build tool
@@ -424,7 +847,7 @@ impl ProviderService for JavaProvider {
                 }
             }
             BuildTool::Unknown => {
-                info!("No build tool detected (Maven or Gradle)");
+                info!("No build tool detected (Maven or Gradle) for path: {}", source_path.display());
                 Ok(Response::new(DependencyResponse {
                     successful: true,
                     error: String::new(),
@@ -457,9 +880,10 @@ impl ProviderService for JavaProvider {
 
         let mut state = self.state.write().await;
 
-        if !state.initialized {
+        // If no instances exist, nothing to notify
+        if state.instances.is_empty() {
             return Ok(Response::new(NotifyFileChangesResponse {
-                error: "Provider not initialized".to_string(),
+                error: "No provider instances initialized".to_string(),
             }));
         }
 
@@ -493,9 +917,10 @@ impl ProviderService for JavaProvider {
                 }
             }
 
-            // Rebuild indexes
+            // Rebuild indexes and resolve annotations
             type_resolver.build_global_index();
             type_resolver.build_inheritance_maps();
+            type_resolver.resolve_annotation_fqdns();
 
             info!("Indexes updated for {} changed files", changed_files.len());
         }
@@ -529,7 +954,7 @@ impl ProviderService for JavaProvider {
 
         // Get file count
         let total_files = state.java_files.len() as i32;
-        let files_processed = if state.initialized { total_files } else { 0 };
+        let files_processed = total_files; // All files in the list have been processed
 
         drop(state);
 
@@ -674,7 +1099,8 @@ impl JavaProvider {
                     let proto_deps: Vec<Dependency> = gradle_deps
                         .iter()
                         .map(|gd| Dependency {
-                            name: gd.artifact_name().to_string(),
+                            // Use groupId.artifactId format for name (matches analyzer-lsp expectation)
+                            name: format!("{}.{}", gd.group, gd.name),
                             version: gd.version.clone().unwrap_or_default(),
                             classifier: String::new(),
                             r#type: "jar".to_string(),

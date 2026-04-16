@@ -31,9 +31,9 @@ impl MavenDependency {
         }
     }
 
-    /// Get the short name (artifactId)
-    pub fn name(&self) -> &str {
-        &self.artifact_id
+    /// Get the dependency name in groupId.artifactId format (used by analyzer-lsp for matching)
+    pub fn name(&self) -> String {
+        format!("{}.{}", self.group_id, self.artifact_id)
     }
 }
 

@@ -2,10 +2,9 @@
 
 use anyhow::{Context, Result};
 use regex::Regex;
-use stack_graphs::graph::StackGraph;
 use std::collections::HashMap;
-use std::path::Path;
 use std::sync::{Arc, Mutex};
+use tracing::debug;
 
 use super::type_resolver::TypeResolver;
 
@@ -78,6 +77,16 @@ pub enum CompositePattern {
 }
 
 impl Pattern {
+    /// Get the pattern string (for Literal and Wildcard patterns)
+    pub fn as_string(&self) -> Option<&str> {
+        match self {
+            Pattern::Literal(s, _) => Some(s),
+            Pattern::Wildcard(s, _) => Some(s),
+            Pattern::Regex(_, _) => None,
+            Pattern::Composite(_) => None,
+        }
+    }
+
     /// Create a pattern from a string, detecting the type
     pub fn from_string(s: &str) -> Result<Self> {
         Self::from_string_with_options(s, PatternOptions::default())
@@ -245,11 +254,18 @@ pub enum AccessModifier {
     Package,  // Default/package-private
 }
 
+/// Annotation filter for querying annotated elements
+#[derive(Debug, Clone)]
+pub struct AnnotationFilter {
+    pub pattern: Option<String>,  // Annotation pattern (e.g., "javax.inject.Inject")
+    pub elements: HashMap<String, String>,  // Required elements (name -> value)
+}
+
 /// Query filters for advanced filtering
 #[derive(Debug, Clone, Default)]
 pub struct QueryFilters {
     /// Optional annotation filter (match elements with this annotation)
-    pub annotated: Option<String>,
+    pub annotated: Option<AnnotationFilter>,
     /// Optional access modifier filter
     pub access_modifier: Option<AccessModifier>,
     /// Optional static filter (true = only static, false = only non-static, None = both)
@@ -269,7 +285,7 @@ pub struct QueryFilters {
 pub struct ReferencedQuery {
     pub pattern: Pattern,
     pub location: LocationType,
-    pub annotated: Option<String>,  // Optional annotation filter (deprecated, use filters instead)
+    pub annotated: Option<AnnotationFilter>,  // Optional annotation filter
     pub filters: Option<QueryFilters>,  // Advanced filters
 }
 
@@ -285,16 +301,14 @@ pub struct QueryResult {
 
 /// Query engine that combines stack-graph and TypeResolver
 pub struct QueryEngine {
-    graph: StackGraph,
     type_resolver: TypeResolver,
     pattern_cache: PatternCache,
 }
 
 impl QueryEngine {
     /// Create a new query engine
-    pub fn new(graph: StackGraph, type_resolver: TypeResolver) -> Self {
+    pub fn new(type_resolver: TypeResolver) -> Self {
         QueryEngine {
-            graph,
             type_resolver,
             pattern_cache: PatternCache::new(),
         }
@@ -307,15 +321,15 @@ impl QueryEngine {
             LocationType::Import => self.query_imports(&query.pattern),
             LocationType::Package => self.query_packages(&query.pattern),
             LocationType::Class => self.query_classes(&query.pattern),
-            LocationType::Type => self.query_types(&query.pattern),
-            LocationType::Field => self.query_fields(&query.pattern),
-            LocationType::Method => self.query_methods(&query.pattern),
+            LocationType::Type => self.query_types(&query.pattern, query.annotated.as_ref()),
+            LocationType::Field => self.query_fields(&query.pattern, query.annotated.as_ref()),
+            LocationType::Method => self.query_methods(&query.pattern, query.annotated.as_ref()),
             LocationType::Enum => self.query_enums(&query.pattern),
             LocationType::Inheritance => self.query_inheritance(&query.pattern),
             LocationType::ImplementsType => self.query_implements(&query.pattern),
             LocationType::MethodCall => self.query_method_calls(&query.pattern),
             LocationType::ConstructorCall => self.query_constructor_calls(&query.pattern),
-            LocationType::Annotation => self.query_annotations(&query.pattern),
+            LocationType::Annotation => self.query_annotations(&query.pattern, query.annotated.as_ref()),
             LocationType::Variable => self.query_variables(&query.pattern),
             LocationType::ReturnType => self.query_return_types(&query.pattern),
         }?;
@@ -363,6 +377,75 @@ impl QueryEngine {
         self.pattern_cache.clear();
     }
 
+    /// Check if annotations match the annotation filter
+    fn matches_annotation_filter(
+        annotations: &[super::type_resolver::AnnotationInfo],
+        filter: &AnnotationFilter,
+    ) -> bool {
+        // If no annotations on the element, filter doesn't match
+        if annotations.is_empty() {
+            return false;
+        }
+
+        // Check each annotation against the filter
+        for annotation in annotations {
+            // Match pattern if specified
+            if let Some(ref pattern_str) = filter.pattern {
+                let pattern = match Pattern::from_string(pattern_str) {
+                    Ok(p) => p,
+                    Err(_) => continue,  // Invalid pattern, skip this annotation
+                };
+
+                // Check if annotation name or FQDN matches the pattern
+                let matches_pattern = if let Some(ref fqdn) = annotation.fqdn {
+                    pattern.matches(fqdn) || pattern.matches(&annotation.name)
+                } else {
+                    pattern.matches(&annotation.name)
+                };
+
+                if !matches_pattern {
+                    continue;  // This annotation doesn't match the pattern
+                }
+            }
+
+            // If pattern matches (or no pattern specified), check elements
+            if !filter.elements.is_empty() {
+                // All required elements must match
+                let mut all_elements_match = true;
+                for (required_name, required_value) in &filter.elements {
+                    if let Some(actual_value) = annotation.elements.get(required_name) {
+                        // Try to match as a regex pattern first
+                        let value_matches = if let Ok(value_pattern) = Pattern::from_string(required_value) {
+                            value_pattern.matches(actual_value)
+                        } else {
+                            // If pattern creation fails, do exact match
+                            actual_value == required_value
+                        };
+
+                        if !value_matches {
+                            all_elements_match = false;
+                            break;
+                        }
+                    } else {
+                        // Required element not present
+                        all_elements_match = false;
+                        break;
+                    }
+                }
+
+                if all_elements_match {
+                    return true;  // This annotation matches completely
+                }
+            } else {
+                // No elements required, pattern match is enough
+                return true;
+            }
+        }
+
+        // No annotation matched the filter
+        false
+    }
+
     /// Query for import statements
     fn query_imports(&self, pattern: &Pattern) -> Result<Vec<QueryResult>> {
         let mut results = Vec::new();
@@ -398,19 +481,51 @@ impl QueryEngine {
         Ok(results)
     }
 
-    /// Query for package declarations
+    /// Query for package declarations and import package references
     fn query_packages(&self, pattern: &Pattern) -> Result<Vec<QueryResult>> {
         let mut results = Vec::new();
+        let mut seen_packages = std::collections::HashSet::new();
 
         for (file_path, file_info) in &self.type_resolver.file_infos {
+            // Match against package declaration
             if let Some(package_name) = &file_info.package_name {
-                if pattern.matches(package_name) {
+                if pattern.matches(package_name) && seen_packages.insert((file_path.clone(), package_name.clone())) {
                     results.push(QueryResult {
                         file_path: file_path.display().to_string(),
                         line_number: 0,  // TODO: Extract from AST
                         column: 0,
                         symbol: package_name.clone(),
                         fqdn: Some(package_name.clone()),
+                    });
+                }
+            }
+
+            // Match against import packages (extract package from FQDN)
+            for (_simple_name, fqdn) in &file_info.explicit_imports {
+                // Extract package part (everything before the last '.')
+                if let Some(last_dot) = fqdn.rfind('.') {
+                    let package_part = &fqdn[..last_dot];
+                    if pattern.matches(package_part) && seen_packages.insert((file_path.clone(), package_part.to_string())) {
+                        results.push(QueryResult {
+                            file_path: file_path.display().to_string(),
+                            line_number: 0,  // TODO: Extract from AST
+                            column: 0,
+                            symbol: package_part.to_string(),
+                            fqdn: Some(package_part.to_string()),
+                        });
+                    }
+                }
+            }
+
+            // Match against wildcard imports (they are already packages)
+            for wildcard_pkg in &file_info.wildcard_imports {
+                if pattern.matches(wildcard_pkg) && seen_packages.insert((file_path.clone(), wildcard_pkg.clone())) {
+                    results.push(QueryResult {
+                        file_path: file_path.display().to_string(),
+                        line_number: 0,  // TODO: Extract from AST
+                        column: 0,
+                        symbol: format!("{}.*", wildcard_pkg),
+                        fqdn: Some(wildcard_pkg.clone()),
                     });
                 }
             }
@@ -446,11 +561,18 @@ impl QueryEngine {
     }
 
     /// Query for type declarations (class, interface, enum)
-    fn query_types(&self, pattern: &Pattern) -> Result<Vec<QueryResult>> {
+    fn query_types(&self, pattern: &Pattern, annotation_filter: Option<&AnnotationFilter>) -> Result<Vec<QueryResult>> {
         let mut results = Vec::new();
 
         for (file_path, file_info) in &self.type_resolver.file_infos {
             for class_info in file_info.classes.values() {
+                // Check annotation filter first
+                if let Some(filter) = annotation_filter {
+                    if !Self::matches_annotation_filter(&class_info.annotations, filter) {
+                        continue;  // Class doesn't have required annotation
+                    }
+                }
+
                 let fqdn = &class_info.fqdn;
 
                 if pattern.matches(fqdn) || pattern.matches(&class_info.simple_name) {
@@ -469,21 +591,81 @@ impl QueryEngine {
     }
 
     /// Query for field declarations
-    fn query_fields(&self, pattern: &Pattern) -> Result<Vec<QueryResult>> {
+    fn query_fields(&self, pattern: &Pattern, annotation_filter: Option<&AnnotationFilter>) -> Result<Vec<QueryResult>> {
         let mut results = Vec::new();
 
         for (file_path, file_info) in &self.type_resolver.file_infos {
             for class_info in file_info.classes.values() {
                 for field in &class_info.fields {
-                    let fqdn = format!("{}.{}", class_info.fqdn, field.name);
+                    // Check annotation filter first
+                    if let Some(filter) = annotation_filter {
+                        if !Self::matches_annotation_filter(&field.annotations, filter) {
+                            continue;  // Field doesn't have required annotation
+                        }
+                    }
 
-                    if pattern.matches(&fqdn) || pattern.matches(&field.name) {
+                    // Resolve field type to FQDN
+                    let field_type_fqdn = self.type_resolver
+                        .resolve_type_name(&field.type_name, file_path)
+                        .unwrap_or_else(|| field.type_name.clone());
+
+                    debug!(
+                        "Field query - File: {}, Class: {}, Field: {}, Type: {} -> FQDN: {}",
+                        file_path.display(),
+                        class_info.simple_name,
+                        field.name,
+                        field.type_name,
+                        field_type_fqdn
+                    );
+
+                    // For FIELD location, pattern matches against the field TYPE, not field name
+                    // Pattern can be:
+                    // 1. Just type: "CustomerRepository" matches any field of that type
+                    // 2. fieldName + type: "repository CustomerRepository" or "* CustomerRepository"
+
+                    // Check if pattern contains a space (field name + type pattern)
+                    let matches = if let Some(pattern_str) = pattern.as_string() {
+                        if pattern_str.contains(' ') {
+                            // Pattern like "* TypedEntity" or "repository CustomerRepository"
+                            let parts: Vec<&str> = pattern_str.splitn(2, ' ').collect();
+                            if parts.len() == 2 {
+                                let field_name_pattern = parts[0];
+                                let field_type_pattern = parts[1];
+
+                                // Match field name (support * wildcard)
+                                let name_matches = field_name_pattern == "*" ||
+                                                   field_name_pattern == &field.name ||
+                                                   Pattern::from_string(field_name_pattern)
+                                                       .ok()
+                                                       .map(|p| p.matches(&field.name))
+                                                       .unwrap_or(false);
+
+                                // Match field type
+                                let type_matches = Pattern::from_string(field_type_pattern)
+                                    .ok()
+                                    .map(|p| p.matches(&field_type_fqdn) || p.matches(&field.type_name))
+                                    .unwrap_or(false);
+
+                                name_matches && type_matches
+                            } else {
+                                false
+                            }
+                        } else {
+                            // Pattern is just a type name
+                            pattern.matches(&field_type_fqdn) || pattern.matches(&field.type_name)
+                        }
+                    } else {
+                        // For regex/composite patterns, try matching against type
+                        pattern.matches(&field_type_fqdn) || pattern.matches(&field.type_name)
+                    };
+
+                    if matches {
                         results.push(QueryResult {
                             file_path: file_path.display().to_string(),
                             line_number: field.position.line,
                             column: field.position.column,
-                            symbol: field.name.clone(),
-                            fqdn: Some(fqdn),
+                            symbol: format!("{}: {}", field.name, field.type_name),
+                            fqdn: Some(field_type_fqdn),
                         });
                     }
                 }
@@ -494,15 +676,74 @@ impl QueryEngine {
     }
 
     /// Query for method declarations
-    fn query_methods(&self, pattern: &Pattern) -> Result<Vec<QueryResult>> {
+    fn query_methods(&self, pattern: &Pattern, annotation_filter: Option<&AnnotationFilter>) -> Result<Vec<QueryResult>> {
         let mut results = Vec::new();
 
         for (file_path, file_info) in &self.type_resolver.file_infos {
             for class_info in file_info.classes.values() {
                 for method in &class_info.methods {
-                    let fqdn = format!("{}.{}", class_info.fqdn, method.name);
+                    // Check annotation filter first
+                    if let Some(filter) = annotation_filter {
+                        let matches = Self::matches_annotation_filter(&method.annotations, filter);
+                        debug!(
+                            "Method {}.{} annotation filter check: {} (annotations: {:?}, filter: pattern={:?}, elements={:?})",
+                            class_info.simple_name,
+                            method.name,
+                            matches,
+                            method.annotations.iter().map(|a| (&a.name, &a.elements)).collect::<Vec<_>>(),
+                            filter.pattern,
+                            filter.elements
+                        );
+                        if !matches {
+                            continue;  // Method doesn't have required annotation
+                        }
+                    }
 
-                    if pattern.matches(&fqdn) || pattern.matches(&method.name) {
+                    let fqdn = format!("{}.{}", class_info.fqdn, method.name);
+                    let simple_class_method = format!("{}.{}", class_info.simple_name, method.name);
+
+                    // Resolve method return type to FQDN
+                    let return_type_fqdn = self.type_resolver
+                        .resolve_type_name(&method.return_type, file_path)
+                        .unwrap_or_else(|| method.return_type.clone());
+
+                    // Check if pattern contains a space (method name + return type pattern)
+                    let matches = if let Some(pattern_str) = pattern.as_string() {
+                        if pattern_str.contains(' ') {
+                            // Pattern like "* TilesConfigurer" or "methodName ReturnType"
+                            let parts: Vec<&str> = pattern_str.splitn(2, ' ').collect();
+                            if parts.len() == 2 {
+                                let method_name_pattern = parts[0];
+                                let return_type_pattern = parts[1];
+
+                                // Match method name (support * wildcard)
+                                let name_matches = method_name_pattern == "*" ||
+                                                   method_name_pattern == &method.name ||
+                                                   Pattern::from_string(method_name_pattern)
+                                                       .ok()
+                                                       .map(|p| p.matches(&method.name))
+                                                       .unwrap_or(false);
+
+                                // Match return type
+                                let type_matches = Pattern::from_string(return_type_pattern)
+                                    .ok()
+                                    .map(|p| p.matches(&return_type_fqdn) || p.matches(&method.return_type))
+                                    .unwrap_or(false);
+
+                                name_matches && type_matches
+                            } else {
+                                false
+                            }
+                        } else {
+                            // Pattern is just a method name or class.method
+                            pattern.matches(&fqdn) || pattern.matches(&simple_class_method) || pattern.matches(&method.name)
+                        }
+                    } else {
+                        // For regex/composite patterns, try matching against method names
+                        pattern.matches(&fqdn) || pattern.matches(&simple_class_method) || pattern.matches(&method.name)
+                    };
+
+                    if matches {
                         results.push(QueryResult {
                             file_path: file_path.display().to_string(),
                             line_number: method.position.line,
@@ -607,32 +848,59 @@ impl QueryEngine {
                 let method_name = &method_call.method_name;
 
                 // Try to resolve receiver type if available
-                let resolved_receiver = if let Some(receiver) = &method_call.receiver_type {
-                    self.type_resolver
-                        .resolve_type_name(receiver, file_path)
-                        .or_else(|| Some(receiver.clone()))
+                let resolved_receiver_fqdn = if let Some(receiver_name) = &method_call.receiver_type {
+                    // First, try to resolve as a type name directly (for static calls or class references)
+                    if let Some(fqdn) = self.type_resolver.resolve_type_name(receiver_name, file_path) {
+                        Some(fqdn)
+                    } else {
+                        // If not a type, it might be a field/variable name
+                        // Look for a field with this name in all classes in this file
+                        let mut field_type = None;
+                        for class_info in file_info.classes.values() {
+                            if let Some(field) = class_info.fields.iter().find(|f| &f.name == receiver_name) {
+                                // Found the field, now resolve its type
+                                field_type = self.type_resolver
+                                    .resolve_type_name(&field.type_name, file_path)
+                                    .or_else(|| Some(field.type_name.clone()));
+                                break;
+                            }
+                        }
+                        field_type
+                    }
                 } else {
                     None
                 };
 
-                // Match against method name or receiver type
+                // Build possible patterns to match:
+                // 1. Full FQDN: com.example.service.HomeService.doThings
+                // 2. Simple class name: HomeService.doThings
+                // 3. Just method name: doThings
+
+                let fqdn_pattern = resolved_receiver_fqdn.as_ref()
+                    .map(|fqdn| format!("{}.{}", fqdn, method_name));
+
+                let simple_class_pattern = resolved_receiver_fqdn.as_ref()
+                    .and_then(|fqdn| fqdn.rfind('.'))
+                    .map(|last_dot| {
+                        let simple_name = &resolved_receiver_fqdn.as_ref().unwrap()[last_dot + 1..];
+                        format!("{}.{}", simple_name, method_name)
+                    });
+
+                // Match against any of the patterns
                 let matches = pattern.matches(method_name)
-                    || resolved_receiver.as_ref().map(|r| pattern.matches(r)).unwrap_or(false);
+                    || fqdn_pattern.as_ref().map(|p| pattern.matches(p)).unwrap_or(false)
+                    || simple_class_pattern.as_ref().map(|p| pattern.matches(p)).unwrap_or(false);
 
                 if matches {
                     // Build a descriptive symbol
-                    let symbol = if let Some(receiver) = &resolved_receiver {
-                        format!("{}.{}", receiver, method_name)
-                    } else {
-                        method_name.clone()
-                    };
+                    let symbol = fqdn_pattern.unwrap_or_else(|| method_name.clone());
 
                     results.push(QueryResult {
                         file_path: file_path.display().to_string(),
                         line_number: method_call.position.line,
                         column: method_call.position.column,
                         symbol,
-                        fqdn: resolved_receiver,
+                        fqdn: resolved_receiver_fqdn,
                     });
                 }
             }
@@ -671,51 +939,140 @@ impl QueryEngine {
     }
 
     /// Query for annotations
-    fn query_annotations(&self, pattern: &Pattern) -> Result<Vec<QueryResult>> {
+    fn query_annotations(&self, pattern: &Pattern, annotation_filter: Option<&AnnotationFilter>) -> Result<Vec<QueryResult>> {
         let mut results = Vec::new();
 
+        // Search through class, method, and field annotations (which have AnnotationInfo with elements)
         for (file_path, file_info) in &self.type_resolver.file_infos {
-            for annotation in &file_info.annotations {
-                let annotation_name = &annotation.annotation_name;
+            for class_info in file_info.classes.values() {
+                // Check class annotations
+                for annotation in &class_info.annotations {
+                    if let Some(result) = self.check_annotation_match(
+                        annotation,
+                        pattern,
+                        annotation_filter,
+                        file_path,
+                        &format!("@{} on class {}", annotation.name, class_info.simple_name),
+                    ) {
+                        results.push(result);
+                    }
+                }
 
-                // Try to resolve annotation type to FQDN
-                let resolved_type = self.type_resolver
-                    .resolve_type_name(annotation_name, file_path)
-                    .unwrap_or_else(|| annotation_name.clone());
+                // Check method annotations
+                for method in &class_info.methods {
+                    for annotation in &method.annotations {
+                        if let Some(result) = self.check_annotation_match(
+                            annotation,
+                            pattern,
+                            annotation_filter,
+                            file_path,
+                            &format!("@{} on {}.{}", annotation.name, class_info.simple_name, method.name),
+                        ) {
+                            results.push(result);
+                        }
+                    }
+                }
 
-                // Match against annotation name (simple or FQDN)
-                if pattern.matches(&resolved_type) || pattern.matches(annotation_name) {
-                    // Build descriptive symbol based on target
-                    let symbol = match &annotation.target {
-                        super::type_resolver::AnnotationTarget::Class(class) => {
-                            format!("@{} on class {}", annotation_name, class)
+                // Check field annotations
+                for field in &class_info.fields {
+                    for annotation in &field.annotations {
+                        if let Some(result) = self.check_annotation_match(
+                            annotation,
+                            pattern,
+                            annotation_filter,
+                            file_path,
+                            &format!("@{} on {}.{}", annotation.name, class_info.simple_name, field.name),
+                        ) {
+                            results.push(result);
                         }
-                        super::type_resolver::AnnotationTarget::Method(class, method) => {
-                            format!("@{} on {}.{}", annotation_name, class, method)
-                        }
-                        super::type_resolver::AnnotationTarget::Field(class, field) => {
-                            format!("@{} on {}.{}", annotation_name, class, field)
-                        }
-                        super::type_resolver::AnnotationTarget::Parameter(class, method, param) => {
-                            format!("@{} on {}.{}({})", annotation_name, class, method, param)
-                        }
-                        super::type_resolver::AnnotationTarget::Unknown => {
-                            format!("@{}", annotation_name)
-                        }
-                    };
-
-                    results.push(QueryResult {
-                        file_path: file_path.display().to_string(),
-                        line_number: annotation.position.line,
-                        column: annotation.position.column,
-                        symbol,
-                        fqdn: Some(resolved_type),
-                    });
+                    }
                 }
             }
         }
 
         Ok(results)
+    }
+
+    /// Helper to check if an annotation matches pattern and filter
+    fn check_annotation_match(
+        &self,
+        annotation: &super::type_resolver::AnnotationInfo,
+        pattern: &Pattern,
+        annotation_filter: Option<&AnnotationFilter>,
+        file_path: &std::path::Path,
+        symbol: &str,
+    ) -> Option<QueryResult> {
+        // Check if annotation name or FQDN matches the pattern
+        let annotation_fqdn = annotation.fqdn.as_ref().unwrap_or(&annotation.name);
+
+        // Match against FQDN, simple name, or try to resolve via wildcard imports
+        let mut pattern_matches = pattern.matches(annotation_fqdn) || pattern.matches(&annotation.name);
+
+        // If no match yet and annotation doesn't have FQDN, try wildcard import resolution
+        if !pattern_matches && annotation.fqdn.is_none() {
+            // Get file info to check wildcard imports
+            if let Some(file_info) = self.type_resolver.file_infos.get(file_path) {
+                for wildcard_pkg in &file_info.wildcard_imports {
+                    let candidate_fqdn = format!("{}.{}", wildcard_pkg, annotation.name);
+                    if pattern.matches(&candidate_fqdn) {
+                        pattern_matches = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if !pattern_matches {
+            return None;  // Pattern doesn't match
+        }
+
+        // Check annotation filter (filter by annotation's own elements)
+        if let Some(filter) = annotation_filter {
+            // If filter has a pattern, it should match (already checked above, but double-check)
+            if let Some(ref filter_pattern_str) = filter.pattern {
+                let filter_pattern = match Pattern::from_string(filter_pattern_str) {
+                    Ok(p) => p,
+                    Err(_) => return None,
+                };
+                if !filter_pattern.matches(annotation_fqdn) && !filter_pattern.matches(&annotation.name) {
+                    return None;
+                }
+            }
+
+            // Check that all required elements match
+            for (required_name, required_value) in &filter.elements {
+                if let Some(actual_value) = annotation.elements.get(required_name) {
+                    // Check if value matches (could be exact or regex)
+                    if !Self::value_matches(actual_value, required_value) {
+                        return None;  // Element doesn't match
+                    }
+                } else {
+                    return None;  // Required element not present
+                }
+            }
+        }
+
+        // Annotation matches!
+        Some(QueryResult {
+            file_path: file_path.display().to_string(),
+            line_number: annotation.position.line,
+            column: annotation.position.column,
+            symbol: symbol.to_string(),
+            fqdn: Some(annotation_fqdn.clone()),
+        })
+    }
+
+    /// Check if a value matches (supports regex patterns)
+    fn value_matches(actual: &str, expected: &str) -> bool {
+        // Try as regex first
+        if let Ok(regex) = Regex::new(expected) {
+            if regex.is_match(actual) {
+                return true;
+            }
+        }
+
+        // Fallback to exact match
+        actual == expected
     }
 
     /// Query for variable declarations
@@ -965,5 +1322,82 @@ mod tests {
 
         assert!(composite.matches("UserService"));
         assert!(!composite.matches("UserTest"));
+    }
+
+    #[test]
+    fn test_annotation_element_regex_matching() {
+        use super::super::type_resolver::{AnnotationInfo, SourcePosition};
+        use std::collections::HashMap;
+
+        // Simulate the @Bean annotation from TilesConfig.java
+        let mut elements = HashMap::new();
+        elements.insert("name".to_string(), "nameForThisBean".to_string());
+        elements.insert("autowireCandidate".to_string(), "false".to_string());
+
+        let annotation = AnnotationInfo {
+            name: "Bean".to_string(),
+            fqdn: Some("org.springframework.context.annotation.Bean".to_string()),
+            elements,
+            position: SourcePosition { line: 16, column: 5, end_line: 16, end_column: 50 },
+        };
+
+        // Create filter matching rule konveyor-java-pattern-test-21
+        let mut filter_elements = HashMap::new();
+        filter_elements.insert("name".to_string(), "nameFor.*".to_string());
+        filter_elements.insert("autowireCandidate".to_string(), "false".to_string());
+
+        let filter = AnnotationFilter {
+            pattern: Some("org.springframework.context.annotation.Bean".to_string()),
+            elements: filter_elements,
+        };
+
+        // Test the matching
+        let annotations = vec![annotation];
+        let result = QueryEngine::matches_annotation_filter(&annotations, &filter);
+
+        assert!(result, "Annotation should match the filter with regex pattern 'nameFor.*' matching 'nameForThisBean' and literal 'false' matching 'false'");
+    }
+
+    #[test]
+    fn test_tiles_config_annotation_extraction() {
+        use super::super::type_resolver::TypeResolver;
+        use std::path::PathBuf;
+
+        let file_path = PathBuf::from("e2e-tests/examples/sample-tiles-app/src/main/java/com/example/config/TilesConfig.java");
+
+        // Skip test if file doesn't exist (e.g., in CI without e2e tests)
+        if !file_path.exists() {
+            println!("Skipping test - file not found: {}", file_path.display());
+            return;
+        }
+
+        let mut resolver = TypeResolver::new();
+        resolver.analyze_file(&file_path).unwrap();
+
+        // Find TilesConfig class in the resolver's file_infos
+        let file_info = resolver.file_infos.get(&file_path).expect("File info should exist");
+        let tiles_config = file_info.classes.get("TilesConfig").expect("TilesConfig class should exist");
+
+        // Find tilesConfigurer method
+        let tiles_configurer_method = tiles_config.methods.iter()
+            .find(|m| m.name == "tilesConfigurer")
+            .expect("tilesConfigurer method should exist");
+
+        // Check method has annotations
+        assert!(!tiles_configurer_method.annotations.is_empty(), "tilesConfigurer method should have annotations");
+
+        // Find @Bean annotation
+        let bean_annotation = tiles_configurer_method.annotations.iter()
+            .find(|a| a.name == "Bean")
+            .expect("@Bean annotation should exist");
+
+        println!("Bean annotation elements: {:?}", bean_annotation.elements);
+
+        // Check annotation elements
+        assert!(bean_annotation.elements.contains_key("name"), "Bean annotation should have 'name' element");
+        assert_eq!(bean_annotation.elements.get("name").unwrap(), "nameForThisBean", "Bean 'name' element should be 'nameForThisBean'");
+
+        assert!(bean_annotation.elements.contains_key("autowireCandidate"), "Bean annotation should have 'autowireCandidate' element");
+        assert_eq!(bean_annotation.elements.get("autowireCandidate").unwrap(), "false", "Bean 'autowireCandidate' element should be 'false'");
     }
 }
